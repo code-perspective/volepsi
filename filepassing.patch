@@ -1,0 +1,109 @@
+--- volePSI/fileBased.cpp
++++ volePSI/fileBased.cpp
+@@ -5,6 +5,42 @@
+ #include "coproto/Socket/AsioSocket.h"
++#include "coproto/Socket/BufferingSocket.h"
++#include <thread>
+ 
+ namespace volePSI
+ {
++    void communicateViaFiles(macoro::eager_task<>& protocol, bool sender, coproto::BufferingSocket& sock)
++    {
++        int s = 0, r = 0;
++        std::string me = sender ? "sender" : "recver";
++        std::string them = !sender ? "sender" : "recver";
++        auto write = [&](){
++            auto b = sock.getOutbound();
++            if (b && b->size()) {
++                std::ofstream message;
++                auto temp = me + ".tmp";
++                auto file = me + "_" + std::to_string(s) + ".bin";
++                message.open(temp, std::ios::binary | std::ios::trunc);
++                message.write((char*)b->data(), b->size());
++                message.close();
++                rename(temp.c_str(), file.c_str());
++                ++s;
++            }
++        };
++        auto read = [&]() {
++            std::ifstream message;
++            auto file = them + "_" + std::to_string(r) + ".bin";
++            while (message.is_open() == false) {
++                message.open(file, std::ios::binary);
++                if (!message.is_open()) std::this_thread::sleep_for(std::chrono::milliseconds(10));
++            }
++            auto fsize = filesize(message);
++            std::vector<oc::u8> buff(fsize);
++            message.read((char*)buff.data(), fsize);
++            message.close();
++            std::remove(file.c_str());
++            ++r;
++            sock.processInbound(buff);
++        };
++        if (sender) write();
++        while (protocol.is_ready() == false) {
++            read();
++            write();
++        }
++    }
+ 
+@@ -298,6 +334,13 @@
+             if (!quiet)
+-                std::cout << "connecting as " << (tls ? "tls " : "") << (isServer ? "server" : "client") << " at address " << ip << std::flush;
++                std::cout << "connecting as " << (tls ? "tls " : "") << (isServer ? "server" : "client") << " at address " << ip << " (or using file-based message passing if requested)" << std::flush;
+             coproto::Socket chl;
++            coproto::BufferingSocket sock;
++            bool useFilePassing = cmd.isSet("file-passing");
+             auto connBegin = timer.setTimePoint("");
++
++            if (useFilePassing) {
++                // Do not connect via socket
++            }
++            else
+             if (tls)
+@@ -357,8 +400,12 @@
+             if (set.size() != cmd.getOr((r == Role::Sender) ? "senderSize" : "receiverSize", set.size()))
+                 throw std::runtime_error("File does not contain the specified set size.");
+-            u64 theirSize;
+-            macoro::sync_wait(chl.send(set.size()));
+-            macoro::sync_wait(chl.recv(theirSize));
+-
+-            if (theirSize != cmd.getOr((r != Role::Sender) ? "senderSize" : "receiverSize", theirSize))
+-                throw std::runtime_error("Other party's set size does not match.");
++            u64 theirSize = 0;
++            
++            if (useFilePassing) {
++                theirSize = cmd.getOr((r != Role::Sender) ? "senderSize" : "receiverSize", set.size());
++            } else {
++                macoro::sync_wait(chl.send(set.size()));
++                macoro::sync_wait(chl.recv(theirSize));
++                if (theirSize != cmd.getOr((r != Role::Sender) ? "senderSize" : "receiverSize", theirSize))
++                    throw std::runtime_error("Other party's set size does not match.");
++            }
+ 
+@@ -379,6 +426,12 @@
+                 sender.init(set.size(), theirSize, statSetParam, seed, mal, 1);
+-                macoro::sync_wait(sender.run(set, chl));
+-                macoro::sync_wait(chl.flush());
++                if (useFilePassing) {
++                    auto protocol = sender.run(set, sock) | macoro::make_eager();
++                    communicateViaFiles(protocol, true, sock);
++                } else {
++                    macoro::sync_wait(sender.run(set, chl));
++                    macoro::sync_wait(chl.flush());
++                }
+ 
+                 auto psiEnd = timer.setTimePoint("");
+@@ -394,6 +447,12 @@
+                 recver.init(theirSize, set.size(), statSetParam, seed, mal, 1);
+-                macoro::sync_wait(recver.run(set, chl));
+-                macoro::sync_wait(chl.flush());
++                if (useFilePassing) {
++                    auto protocol = recver.run(set, sock) | macoro::make_eager();
++                    communicateViaFiles(protocol, false, sock);
++                } else {
++                    macoro::sync_wait(recver.run(set, chl));
++                    macoro::sync_wait(chl.flush());
++                }
+ 
+ 
