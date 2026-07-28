@@ -1,11 +1,66 @@
 #include "fileBased.h"
 #include "cryptoTools/Crypto/RandomOracle.h"
 #include "RsPsi.h"
-
 #include "coproto/Socket/AsioSocket.h"
+#include "coproto/Socket/BufferingSocket.h"
+#include <thread>
+#include <unistd.h>
+#include <iomanip>
 
 namespace volePSI
 {
+
+    void communicateViaFiles(macoro::eager_task<>& protocol, bool sender, coproto::BufferingSocket& sock)
+    {
+        int s = 0, r = 0;
+        std::string me = sender ? "sender" : "recver";
+        std::string them = !sender ? "sender" : "recver";
+        auto write = [&](){
+            auto b = sock.getOutbound();
+            if (b && b->size()) {
+                std::ofstream message;
+                auto temp = me + ".tmp";
+                auto file = me + "_" + std::to_string(s) + ".bin";
+                message.open(temp, std::ios::binary | std::ios::trunc);
+                message.write((char*)b->data(), b->size());
+                message.close();
+                rename(temp.c_str(), file.c_str());
+                
+                auto txtFile = me + "_" + std::to_string(s) + ".txt";
+                std::ofstream txtMessage(txtFile, std::ios::trunc);
+                txtMessage << std::hex << std::setfill('0');
+                for (size_t i = 0; i < b->size(); ++i) {
+                    txtMessage << std::setw(2) << (int)((unsigned char)b->data()[i]);
+                    if ((i + 1) % 32 == 0) txtMessage << "\n";
+                }
+                txtMessage << std::dec << "\n";
+                txtMessage.close();
+
+                ++s;
+            }
+        };
+        auto read = [&]() {
+            std::ifstream message;
+            auto file = them + "_" + std::to_string(r) + ".bin";
+            while (message.is_open() == false) {
+                message.open(file, std::ios::binary);
+                if (!message.is_open()) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            }
+            auto fsize = filesize(message);
+            std::vector<oc::u8> buff(fsize);
+            message.read((char*)buff.data(), fsize);
+            message.close();
+            // std::remove(file.c_str()); // KEEP INTERMEDIATE FILES
+            ++r;
+            sock.processInbound(buff);
+        };
+        if (sender) write();
+        while (protocol.is_ready() == false) {
+            read();
+            write();
+        }
+    }
+
 
     std::ifstream::pos_type filesize(std::ifstream& file)
     {
@@ -294,10 +349,16 @@ namespace volePSI
                 std::cout << std::chrono::duration_cast<std::chrono::milliseconds>(readEnd - readBegin).count() << "ms" << std::endl;
 
 
-            if (!quiet)
-                std::cout << "connecting as " << (tls ? "tls " : "") << (isServer ? "server" : "client") << " at address " << ip << std::flush;
             coproto::Socket chl;
+            coproto::BufferingSocket sock;
+            bool useFilePassing = cmd.isSet("file-passing");
             auto connBegin = timer.setTimePoint("");
+            
+            if (useFilePassing) {
+               if (!quiet) std::cout << "using file-based message passing" << std::flush;
+            } else {
+               if (!quiet) std::cout << "connecting as " << (tls ? "tls " : "") << (isServer ? "server" : "client") << " at address " << ip << std::flush;
+
             if (tls)
             {
                 std::string CACert = cmd.get<std::string>("CA");
@@ -350,6 +411,7 @@ namespace volePSI
                 throw std::runtime_error("COPROTO_ENABLE_BOOST must be define (via cmake) to use tcp sockets. " COPROTO_LOCATION);
 #endif
             }
+            }
             auto connEnd = timer.setTimePoint("");
             if (!quiet)
                 std::cout << ' ' << std::chrono::duration_cast<std::chrono::milliseconds>(connEnd - connBegin).count()
@@ -357,12 +419,15 @@ namespace volePSI
 
             if (set.size() != cmd.getOr((r == Role::Sender) ? "senderSize" : "receiverSize", set.size()))
                 throw std::runtime_error("File does not contain the specified set size.");
-            u64 theirSize;
-            macoro::sync_wait(chl.send(set.size()));
-            macoro::sync_wait(chl.recv(theirSize));
-
-            if (theirSize != cmd.getOr((r != Role::Sender) ? "senderSize" : "receiverSize", theirSize))
-                throw std::runtime_error("Other party's set size does not match.");
+            u64 theirSize = 0;
+            if (useFilePassing) {
+                theirSize = cmd.getOr((r != Role::Sender) ? "senderSize" : "receiverSize", set.size());
+            } else {
+                macoro::sync_wait(chl.send(set.size()));
+                macoro::sync_wait(chl.recv(theirSize));
+                if (theirSize != cmd.getOr((r != Role::Sender) ? "senderSize" : "receiverSize", theirSize))
+                    throw std::runtime_error("Other party's set size does not match.");
+            }
 
 
 
@@ -378,8 +443,13 @@ namespace volePSI
                 sender.mDebug = debug;
                 sender.setMultType(type);
                 sender.init(set.size(), theirSize, statSetParam, seed, mal, 1);
-                macoro::sync_wait(sender.run(set, chl));
-                macoro::sync_wait(chl.flush());
+                if (useFilePassing) {
+                    auto protocol = sender.run(set, sock) | macoro::make_eager();
+                    communicateViaFiles(protocol, true, sock);
+                } else {
+                    macoro::sync_wait(sender.run(set, chl));
+                    macoro::sync_wait(chl.flush());
+                }
 
                 auto psiEnd = timer.setTimePoint("");
                 if (!quiet)
@@ -393,8 +463,13 @@ namespace volePSI
                 recver.mDebug = debug;
                 recver.setMultType(type);
                 recver.init(theirSize, set.size(), statSetParam, seed, mal, 1);
-                macoro::sync_wait(recver.run(set, chl));
-                macoro::sync_wait(chl.flush());
+                if (useFilePassing) {
+                    auto protocol = recver.run(set, sock) | macoro::make_eager();
+                    communicateViaFiles(protocol, false, sock);
+                } else {
+                    macoro::sync_wait(recver.run(set, chl));
+                    macoro::sync_wait(chl.flush());
+                }
 
 
                 auto psiEnd = timer.setTimePoint("");

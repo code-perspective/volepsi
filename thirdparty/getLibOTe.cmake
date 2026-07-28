@@ -46,6 +46,7 @@ if(NOT ${DEP_NAME}_FOUND OR LIBOTE_DEV)
                        -DENABLE_SODIUM=${VOLE_PSI_ENABLE_SODIUM}
                        -DENABLE_RELIC=${VOLE_PSI_ENABLE_RELIC}
                        -DSODIUM_MONTGOMERY=${VOLE_PSI_SODIUM_MONTGOMERY}
+                       -DMACORO_TESTS=OFF
                        )
     set(BUILD_CMD     ${CMAKE_COMMAND} --build ${BUILD_DIR} --config ${CMAKE_BUILD_TYPE})
     set(INSTALL_CMD   ${CMAKE_COMMAND} --install ${BUILD_DIR} --config ${CMAKE_BUILD_TYPE} --prefix ${VOLEPSI_THIRDPARTY_DIR})
@@ -60,6 +61,7 @@ if(NOT ${DEP_NAME}_FOUND OR LIBOTE_DEV)
     run(NAME "libOTe Checkout ${GIT_TAG} " CMD ${CHECKOUT_CMD}  WD ${CLONE_DIR})
     run(NAME "libOTe submodule"       CMD ${SUBMODULE_CMD} WD ${CLONE_DIR})
     run(NAME "libOTe Configure"       CMD ${CONFIGURE_CMD} WD ${CLONE_DIR})
+    run(NAME "Patch dependencies"     CMD ${CMAKE_COMMAND} -P ${CMAKE_CURRENT_LIST_DIR}/patch_deps.cmake WD ${CLONE_DIR})
     run(NAME "libOTe Build"           CMD ${BUILD_CMD}     WD ${CLONE_DIR})
     run(NAME "libOTe Install"         CMD ${INSTALL_CMD}   WD ${CLONE_DIR})
 
